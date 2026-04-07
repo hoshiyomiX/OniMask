@@ -1,8 +1,13 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <unwind.h>
+#include <link.h>
+#include <cstdlib>
+#include <cstdarg>
 #include <span>
 
 #include <lsplt.hpp>
@@ -193,6 +198,15 @@ DCL_HOOK_FUNC(static int, dlclose, void *handle) {
     return 0;
 }
 
+// =====================================================================
+// Detection Hiding: Master enable flag
+// =====================================================================
+// Activated during hook_plt() (Zygote bootstrap) and deactivated in
+// pthread_attr_destroy before restore_plt_hook(). All three phases
+// check this flag before applying any filtering.
+
+static bool zygisk_hide_active = false;
+
 // We cannot directly call `dlclose` to unload ourselves, otherwise when `dlclose` returns,
 // it will return to our code which has been unmapped, causing segmentation fault.
 // Instead, we hook `pthread_attr_destroy` which will be called when VM daemon threads start.
@@ -205,6 +219,8 @@ DCL_HOOK_FUNC(static int, pthread_attr_destroy, void *target) {
 
     ZLOGV("pthread_attr_destroy\n");
     if (g_hook->should_unmap) {
+        // Phase 1: Disable detection hiding before restoring hooks
+        zygisk_hide_active = false;
         g_hook->restore_plt_hook();
         if (g_hook->should_unmap) {
             ZLOGV("dlclosing self\n");
@@ -223,6 +239,249 @@ DCL_HOOK_FUNC(static int, pthread_attr_destroy, void *target) {
 }
 
 #undef DCL_HOOK_FUNC
+
+// =====================================================================
+// Phase 1: Detection Hiding — dl_iterate_phdr filtering
+// =====================================================================
+// Filters out libzygisk.so entries from dl_iterate_phdr to prevent
+// detection tools from discovering Zygisk through linker introspection.
+// The hook is installed in libandroid_runtime.so and libart.so PLTs
+// to cover the broadest range of callers within the Zygote process.
+
+using phdr_cb_t = int (*)(struct dl_phdr_info *, size_t, void *);
+// Separate backup pointers per library to ensure correct PLT restoration.
+// Each library's GOT entry has its own original address; sharing a single
+// pointer would cause the second registration to overwrite the first.
+static int (*orig_dl_iterate_phdr_runtime)(phdr_cb_t, void *) = nullptr;
+static int (*orig_dl_iterate_phdr_art)(phdr_cb_t, void *) = nullptr;
+
+struct phdr_filter_ctx {
+    phdr_cb_t user_cb;
+    void *user_data;
+};
+
+static int phdr_filter_callback(struct dl_phdr_info *info, size_t size, void *data) {
+    auto *ctx = static_cast<phdr_filter_ctx *>(data);
+
+    // Filter entries matching libzygisk.so
+    if (info->dlpi_name && strstr(info->dlpi_name, ZYGISKLDR)) {
+        ZLOGV("hide: filtered dl_phdr entry [%s]\n", info->dlpi_name);
+        return 0; // Continue iteration, skip this entry
+    }
+
+    return ctx->user_cb(info, size, ctx->user_data);
+}
+
+static int new_dl_iterate_phdr(phdr_cb_t callback, void *data) {
+    if (!orig_dl_iterate_phdr_runtime) {
+        orig_dl_iterate_phdr_runtime = (decltype(orig_dl_iterate_phdr_runtime))
+            dlsym(RTLD_DEFAULT, "dl_iterate_phdr");
+        orig_dl_iterate_phdr_art = orig_dl_iterate_phdr_runtime;
+    }
+    if (!orig_dl_iterate_phdr_runtime) return 0;
+
+    if (!zygisk_hide_active) {
+        return orig_dl_iterate_phdr_runtime(callback, data);
+    }
+
+    phdr_filter_ctx ctx{callback, data};
+    return orig_dl_iterate_phdr_runtime(phdr_filter_callback, &ctx);
+}
+
+// =====================================================================
+// Phase 2: /proc/self/maps Sanitization — openat filtering
+// =====================================================================
+// Intercepts openat() calls targeting /proc/self/maps or /proc/<pid>/maps.
+// Returns a seekable anonymous file (memfd) containing filtered maps content
+// with all libzygisk.so lines removed. Falls back to a pipe if memfd_create
+// is unavailable (not seekable, but sufficient for sequential readers).
+//
+// Installed in libart.so PLT only — ART is the primary maps consumer through
+// Java-level I/O. Zygisk internals (lsplt::MapInfo::Scan, xopen_dir) read maps
+// and fd directories through libc, bypassing libart's PLT entirely.
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
+static int (*orig_openat)(int, const char *, int, ...) = nullptr;
+
+static bool is_proc_maps_path(const char *pathname) {
+    if (!pathname) return false;
+    // Fast reject: most paths don't start with '/' or second char isn't 'p'
+    if (pathname[0] != '/' || pathname[1] != 'p') return false;
+    if (strncmp(pathname, "/proc/", 6) != 0) return false;
+    // Check for "/maps" suffix (5 chars) with minimum viable path length
+    size_t len = strlen(pathname);
+    if (len < 11) return false; // minimum: "/proc/1/maps"
+    if (strcmp(pathname + len - 5, "/maps") != 0) return false;
+    return true;
+}
+
+static bool is_zygisk_maps_line(const char *line, size_t line_len) {
+    // Fast reject: ZYGISKLDR = "libzygisk.so" (12 chars), must fit in line
+    if (line_len < sizeof(ZYGISKLDR) - 1) return false;
+    // Use memmem for substring search; falls back to strstr on some libc
+    const char *needle = ZYGISKLDR;
+    size_t needle_len = sizeof(ZYGISKLDR) - 1;
+    const void *found = nullptr;
+#if defined(__has_builtin)
+    #if __has_builtin(__builtin_memmem)
+    found = __builtin_memmem(line, line_len, needle, needle_len);
+    #else
+    found = strstr(line, needle);
+    #endif
+#else
+    found = strstr(line, needle);
+#endif
+    return found != nullptr;
+}
+
+// Write all bytes, handling partial writes and EINTR.
+// Returns true on full success, false on any write error.
+static bool write_all(int fd, const char *buf, size_t count) {
+    while (count > 0) {
+        ssize_t n = write(fd, buf, count);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        buf += n;
+        count -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static int new_openat(int dirfd, const char *pathname, int flags, ...) {
+    // Extract mode_t when O_CREAT is set (variadic argument)
+    int mode = 0;
+    if ((flags & O_CREAT) != 0) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, int);
+        va_end(args);
+    }
+
+    // Fast path: if not hiding or path is not maps, pass through immediately
+    if (!zygisk_hide_active || !is_proc_maps_path(pathname)) {
+        return orig_openat(dirfd, pathname, flags, mode);
+    }
+
+    // Open the real maps file to read its content
+    int real_fd = orig_openat(dirfd, pathname, flags, mode);
+    if (real_fd < 0) return real_fd;
+
+    // Read entire maps content into memory
+    string content;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(real_fd, buf, sizeof(buf))) > 0) {
+        content.append(buf, static_cast<size_t>(n));
+    }
+    close(real_fd);
+
+    if (n < 0) {
+        // Read error — re-open original for the caller (degraded: unfiltered)
+        return orig_openat(dirfd, pathname, flags, mode);
+    }
+
+    // Filter: build output with all lines EXCEPT those referencing Zygisk
+    string filtered;
+    filtered.reserve(content.size());
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t nl = content.find('\n', pos);
+        size_t line_end = (nl != string::npos) ? nl : content.size();
+        size_t next_pos = (nl != string::npos) ? nl + 1 : content.size();
+
+        if (!is_zygisk_maps_line(content.data() + pos, line_end - pos)) {
+            filtered.append(content, pos, next_pos - pos);
+        } else {
+            ZLOGV("hide: filtered maps line\n");
+        }
+
+        pos = next_pos;
+    }
+
+    // Create anonymous file with filtered content (seekable + O_CLOEXEC)
+    int out_fd = syscall(__NR_memfd_create, "maps", MFD_CLOEXEC);
+    if (out_fd >= 0) {
+        if (!write_all(out_fd, filtered.data(), filtered.size())) {
+            close(out_fd);
+            out_fd = -1;
+        } else {
+            lseek(out_fd, 0, SEEK_SET);
+        }
+    }
+
+    // Fallback: use pipe (not seekable, but works for sequential readers)
+    if (out_fd < 0) {
+        int pipefd[2];
+        if (pipe2(pipefd, O_CLOEXEC) == 0) {
+            write_all(pipefd[1], filtered.data(), filtered.size());
+            close(pipefd[1]);
+            out_fd = pipefd[0];
+        }
+    }
+
+    // Last resort: re-open original unfiltered (app sees Zygisk, but won't crash)
+    if (out_fd < 0) {
+        return orig_openat(dirfd, pathname, flags, mode);
+    }
+
+    return out_fd;
+}
+
+// =====================================================================
+// Phase 3: /proc/self/fd Sanitization — readlink filtering
+// =====================================================================
+// Intercepts readlink() calls on /proc/self/fd/* and /proc/<pid>/fd/*.
+// If the symlink target points to a Zygisk-related file (contains
+// libzygisk.so in the path), the result is replaced with "/dev/null".
+//
+// Installed in libart.so PLT only. Zygisk internals use opendir/readdir
+// on /proc/self/fd through libc (not libart's PLT), so they are unaffected.
+
+static ssize_t (*orig_readlink)(const char *, char *, size_t) = nullptr;
+
+static bool is_proc_fd_path(const char *pathname) {
+    if (!pathname) return false;
+    if (strncmp(pathname, "/proc/", 6) != 0) return false;
+    // Must contain "/fd/" after the /proc/ prefix
+    const char *fd_marker = strstr(pathname + 6, "/fd/");
+    return fd_marker != nullptr;
+}
+
+static ssize_t new_readlink(const char *pathname, char *buf, size_t bufsiz) {
+    ssize_t ret = orig_readlink(pathname, buf, bufsiz);
+
+    // Only filter when hiding is active, readlink succeeded, and path is /proc/*/fd/*
+    if (!zygisk_hide_active || ret <= 0 || !is_proc_fd_path(pathname)) {
+        return ret;
+    }
+
+    // Null-terminate the result for safe string operations
+    // (readlink does NOT null-terminate on success)
+    size_t ret_len = static_cast<size_t>(ret);
+    if (ret_len < bufsiz) {
+        buf[ret_len] = '\0';
+    } else if (bufsiz > 0) {
+        buf[bufsiz - 1] = '\0';
+    }
+
+    // If the symlink target references a Zygisk library, replace with /dev/null
+    if (strstr(buf, ZYGISKLDR) != nullptr) {
+        const char dev_null[] = "/dev/null";
+        size_t dlen = sizeof(dev_null) - 1; // 9, no null terminator in count
+        if (dlen <= bufsiz) {
+            memcpy(buf, dev_null, dlen);
+            ZLOGV("hide: redirected fd symlink to /dev/null\n");
+            return static_cast<ssize_t>(dlen);
+        }
+    }
+
+    return ret;
+}
 
 // -----------------------------------------------------------------
 
@@ -244,6 +503,13 @@ ZygiskContext::~ZygiskContext() {
 
     if (!is_child())
         return;
+
+    // Phase 1: Clean up detection environment variables.
+    // Preserve ZYGISK_ENABLED for the Magisk Manager app — it is intentionally
+    // set in app_specialize_post() (module.cpp) for Zygisk status detection.
+    if (!(info_flags & +ZygiskStateFlags::ProcessIsMagiskApp)) {
+        unsetenv("ZYGISK_ENABLED");
+    }
 
     zygisk_close_logd();
     android_logging();
@@ -421,6 +687,12 @@ void HookContext::hook_plt() {
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, strdup);
     PLT_HOOK_REGISTER_SYM(android_runtime_dev, android_runtime_inode, "__android_log_close", android_log_close);
 
+    // Phase 1: Hook dl_iterate_phdr to filter Zygisk entries from linker introspection
+    zygisk_hide_active = true;
+    register_hook(android_runtime_dev, android_runtime_inode, "dl_iterate_phdr",
+        reinterpret_cast<void *>(new_dl_iterate_phdr),
+        reinterpret_cast<void **>(&orig_dl_iterate_phdr_runtime));
+
     if (!lsplt::CommitHook())
         ZLOGE("plt_hook failed\n");
 
@@ -441,6 +713,22 @@ void HookContext::hook_unloader() {
     }
 
     PLT_HOOK_REGISTER(art_dev, art_inode, pthread_attr_destroy);
+
+    // Phase 1: Also hook dl_iterate_phdr in libart.so for broader coverage
+    register_hook(art_dev, art_inode, "dl_iterate_phdr",
+        reinterpret_cast<void *>(new_dl_iterate_phdr),
+        reinterpret_cast<void **>(&orig_dl_iterate_phdr_art));
+
+    // Phase 2: Hook openat in libart.so to sanitize /proc/self/maps content
+    register_hook(art_dev, art_inode, "openat",
+        reinterpret_cast<void *>(new_openat),
+        reinterpret_cast<void **>(&orig_openat));
+
+    // Phase 3: Hook readlink in libart.so to sanitize /proc/self/fd symlink targets
+    register_hook(art_dev, art_inode, "readlink",
+        reinterpret_cast<void *>(new_readlink),
+        reinterpret_cast<void **>(&orig_readlink));
+
     if (!lsplt::CommitHook())
         ZLOGE("plt_hook failed\n");
 }
