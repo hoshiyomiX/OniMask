@@ -2,6 +2,7 @@
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <limits.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unwind.h>
@@ -198,6 +199,15 @@ DCL_HOOK_FUNC(static int, dlclose, void *handle) {
     return 0;
 }
 
+// =====================================================================
+// Detection Hiding: Master enable flag
+// =====================================================================
+// Activated during hook_plt() (Zygote bootstrap) and deactivated in
+// pthread_attr_destroy before restore_plt_hook(). All three phases
+// check this flag before applying any filtering.
+
+static bool zygisk_hide_active = false;
+
 // We cannot directly call `dlclose` to unload ourselves, otherwise when `dlclose` returns,
 // it will return to our code which has been unmapped, causing segmentation fault.
 // Instead, we hook `pthread_attr_destroy` which will be called when VM daemon threads start.
@@ -232,15 +242,6 @@ DCL_HOOK_FUNC(static int, pthread_attr_destroy, void *target) {
 #undef DCL_HOOK_FUNC
 
 // =====================================================================
-// Detection Hiding: Master enable flag
-// =====================================================================
-// Activated during hook_plt() (Zygote bootstrap) and deactivated in
-// pthread_attr_destroy before restore_plt_hook(). All three phases
-// check this flag before applying any filtering.
-
-static bool zygisk_hide_active = false;
-
-// =====================================================================
 // Phase 1: Detection Hiding — dl_iterate_phdr filtering
 // =====================================================================
 // Filters out libzygisk.so entries from dl_iterate_phdr to prevent
@@ -254,6 +255,31 @@ using phdr_cb_t = int (*)(struct dl_phdr_info *, size_t, void *);
 // pointer would cause the second registration to overwrite the first.
 static int (*orig_dl_iterate_phdr_runtime)(phdr_cb_t, void *) = nullptr;
 static int (*orig_dl_iterate_phdr_art)(phdr_cb_t, void *) = nullptr;
+
+// =====================================================================
+// Module Hook Chain Protection
+// =====================================================================
+// Modules may have already registered PLT hooks on libart.so for the same
+// symbols that OniMask phases use (openat, readlink, dl_iterate_phdr).
+// Since hook_unloader() runs AFTER module preAppSpecialize(), OniMask's
+// register_hook() would overwrite the module's GOT entry.
+//
+// Solution: Before OniMask registers, snapshot the current GOT value.
+// If it differs from what we expect (original libc function), a module
+// has hooked it. We store the module's hook as a "chained" handler and
+// OniMask's wrapper calls it after applying detection filtering.
+//
+// Chain order: Caller -> OniMask filter -> Module hook -> Original libc
+//
+// art_dev/art_inode are stored here for potential use by other components.
+
+static dev_t  g_art_dev = 0;
+static ino_t  g_art_inode = 0;
+
+// Chained module hooks (set in hook_unloader if a module pre-hooked these)
+static int (*chained_openat)(int, const char *, int, ...) = nullptr;
+static ssize_t (*chained_readlink)(const char *, char *, size_t) = nullptr;
+static int (*chained_dl_iterate_phdr_art)(phdr_cb_t, void *) = nullptr;
 
 struct phdr_filter_ctx {
     phdr_cb_t user_cb;
@@ -305,6 +331,14 @@ static int new_dl_iterate_phdr(phdr_cb_t callback, void *data) {
 #endif
 
 static int (*orig_openat)(int, const char *, int, ...) = nullptr;
+
+static int do_openat(int dirfd, const char *pathname, int flags, int mode) {
+    // Chain: call module hook if one was registered before OniMask
+    if (chained_openat) {
+        return chained_openat(dirfd, pathname, flags, mode);
+    }
+    return orig_openat(dirfd, pathname, flags, mode);
+}
 
 static bool is_proc_maps_path(const char *pathname) {
     if (!pathname) return false;
@@ -362,9 +396,9 @@ static int new_openat(int dirfd, const char *pathname, int flags, ...) {
         va_end(args);
     }
 
-    // Fast path: if not hiding or path is not maps, pass through immediately
+    // Fast path: if not hiding or path is not maps, pass through chain
     if (!zygisk_hide_active || !is_proc_maps_path(pathname)) {
-        return orig_openat(dirfd, pathname, flags, mode);
+        return do_openat(dirfd, pathname, flags, mode);
     }
 
     // Open the real maps file to read its content
@@ -403,8 +437,11 @@ static int new_openat(int dirfd, const char *pathname, int flags, ...) {
         pos = next_pos;
     }
 
-    // Create anonymous file with filtered content (seekable + O_CLOEXEC)
-    int out_fd = syscall(__NR_memfd_create, "maps", MFD_CLOEXEC);
+    // Create anonymous file with filtered content (seekable)
+    // Respect caller's O_CLOEXEC: only set MFD_CLOEXEC when requested.
+    const bool caller_wants_cloexec = (flags & O_CLOEXEC) != 0;
+    int out_fd = syscall(__NR_memfd_create, "maps",
+        caller_wants_cloexec ? MFD_CLOEXEC : 0);
     if (out_fd >= 0) {
         if (!write_all(out_fd, filtered.data(), filtered.size())) {
             close(out_fd);
@@ -417,16 +454,16 @@ static int new_openat(int dirfd, const char *pathname, int flags, ...) {
     // Fallback: use pipe (not seekable, but works for sequential readers)
     if (out_fd < 0) {
         int pipefd[2];
-        if (pipe2(pipefd, O_CLOEXEC) == 0) {
+        if (pipe2(pipefd, caller_wants_cloexec ? O_CLOEXEC : 0) == 0) {
             write_all(pipefd[1], filtered.data(), filtered.size());
             close(pipefd[1]);
             out_fd = pipefd[0];
         }
     }
 
-    // Last resort: re-open original unfiltered (app sees Zygisk, but won't crash)
+    // Last resort: pass through hook chain (app sees Zygisk, but won't crash)
     if (out_fd < 0) {
-        return orig_openat(dirfd, pathname, flags, mode);
+        return do_openat(dirfd, pathname, flags, mode);
     }
 
     return out_fd;
@@ -444,6 +481,14 @@ static int new_openat(int dirfd, const char *pathname, int flags, ...) {
 
 static ssize_t (*orig_readlink)(const char *, char *, size_t) = nullptr;
 
+static ssize_t do_readlink(const char *pathname, char *buf, size_t bufsiz) {
+    // Chain: call module hook if one was registered before OniMask
+    if (chained_readlink) {
+        return chained_readlink(pathname, buf, bufsiz);
+    }
+    return orig_readlink(pathname, buf, bufsiz);
+}
+
 static bool is_proc_fd_path(const char *pathname) {
     if (!pathname) return false;
     if (strncmp(pathname, "/proc/", 6) != 0) return false;
@@ -458,6 +503,25 @@ static ssize_t new_readlink(const char *pathname, char *buf, size_t bufsiz) {
     // Only filter when hiding is active, readlink succeeded, and path is /proc/*/fd/*
     if (!zygisk_hide_active || ret <= 0 || !is_proc_fd_path(pathname)) {
         return ret;
+    }
+
+    // If a module pre-hooked readlink, call it first, then filter the result.
+    // This allows modules to transform the symlink target before OniMask
+    // checks for Zygisk-related paths.
+    if (chained_readlink && ret > 0) {
+        char chain_buf[PATH_MAX];
+        ssize_t chain_ret = chained_readlink(pathname, chain_buf,
+            static_cast<size_t>(ret) < sizeof(chain_buf)
+                ? static_cast<size_t>(ret) + 1 : sizeof(chain_buf));
+        if (chain_ret > 0) {
+            ret = chain_ret;
+            memcpy(buf, chain_buf,
+                static_cast<size_t>(ret) < bufsiz ? static_cast<size_t>(ret) : bufsiz);
+            // Null-terminate for subsequent strstr check
+            size_t ret_len = static_cast<size_t>(ret);
+            if (ret_len < bufsiz) buf[ret_len] = '\0';
+            else if (bufsiz > 0) buf[bufsiz - 1] = '\0';
+        }
     }
 
     // Null-terminate the result for safe string operations
@@ -712,22 +776,73 @@ void HookContext::hook_unloader() {
         }
     }
 
+    // Store art device/inode for module hook chain detection
+    g_art_dev = art_dev;
+    g_art_inode = art_inode;
+
+    // Detect if modules have already hooked the symbols we need.
+    // Resolve the real libc function addresses for comparison.
+    // If a module hooked these symbols, the GOT value will differ
+    // from the real function, and we chain through the module's hook.
+    auto real_openat = reinterpret_cast<int (*)(int, const char *, int, ...)>(
+        dlsym(RTLD_DEFAULT, "openat"));
+    auto real_readlink = reinterpret_cast<ssize_t (*)(const char *, char *, size_t)>(
+        dlsym(RTLD_DEFAULT, "readlink"));
+    auto real_dl_iterate_phdr = reinterpret_cast<int (*)(phdr_cb_t, void *)>(
+        dlsym(RTLD_DEFAULT, "dl_iterate_phdr"));
+
     PLT_HOOK_REGISTER(art_dev, art_inode, pthread_attr_destroy);
 
     // Phase 1: Also hook dl_iterate_phdr in libart.so for broader coverage
-    register_hook(art_dev, art_inode, "dl_iterate_phdr",
-        reinterpret_cast<void *>(new_dl_iterate_phdr),
-        reinterpret_cast<void **>(&orig_dl_iterate_phdr_art));
+    // Save current GOT value before overwriting (may be a module hook)
+    {
+        void *saved = nullptr;
+        lsplt::RegisterHook(art_dev, art_inode, "dl_iterate_phdr",
+            reinterpret_cast<void *>(new_dl_iterate_phdr), &saved);
+        if (saved && saved != reinterpret_cast<void *>(real_dl_iterate_phdr)) {
+            chained_dl_iterate_phdr_art =
+                reinterpret_cast<int (*)(phdr_cb_t, void *)>(saved);
+            ZLOGV("hide: chaining module dl_iterate_phdr hook\n");
+        }
+        orig_dl_iterate_phdr_art =
+            reinterpret_cast<int (*)(phdr_cb_t, void *)>(saved);
+        plt_backup.emplace_back(art_dev, art_inode, "dl_iterate_phdr",
+            reinterpret_cast<void **>(&orig_dl_iterate_phdr_art));
+    }
 
     // Phase 2: Hook openat in libart.so to sanitize /proc/self/maps content
-    register_hook(art_dev, art_inode, "openat",
-        reinterpret_cast<void *>(new_openat),
-        reinterpret_cast<void **>(&orig_openat));
+    // Save current GOT value before overwriting (may be a module hook)
+    {
+        void *saved = nullptr;
+        lsplt::RegisterHook(art_dev, art_inode, "openat",
+            reinterpret_cast<void *>(new_openat), &saved);
+        if (saved && saved != reinterpret_cast<void *>(real_openat)) {
+            chained_openat =
+                reinterpret_cast<int (*)(int, const char *, int, ...)>(saved);
+            ZLOGV("hide: chaining module openat hook\n");
+        }
+        orig_openat =
+            reinterpret_cast<int (*)(int, const char *, int, ...)>(saved);
+        plt_backup.emplace_back(art_dev, art_inode, "openat",
+            reinterpret_cast<void **>(&orig_openat));
+    }
 
     // Phase 3: Hook readlink in libart.so to sanitize /proc/self/fd symlink targets
-    register_hook(art_dev, art_inode, "readlink",
-        reinterpret_cast<void *>(new_readlink),
-        reinterpret_cast<void **>(&orig_readlink));
+    // Save current GOT value before overwriting (may be a module hook)
+    {
+        void *saved = nullptr;
+        lsplt::RegisterHook(art_dev, art_inode, "readlink",
+            reinterpret_cast<void *>(new_readlink), &saved);
+        if (saved && saved != reinterpret_cast<void *>(real_readlink)) {
+            chained_readlink =
+                reinterpret_cast<ssize_t (*)(const char *, char *, size_t)>(saved);
+            ZLOGV("hide: chaining module readlink hook\n");
+        }
+        orig_readlink =
+            reinterpret_cast<ssize_t (*)(const char *, char *, size_t)>(saved);
+        plt_backup.emplace_back(art_dev, art_inode, "readlink",
+            reinterpret_cast<void **>(&orig_readlink));
+    }
 
     if (!lsplt::CommitHook())
         ZLOGE("plt_hook failed\n");
